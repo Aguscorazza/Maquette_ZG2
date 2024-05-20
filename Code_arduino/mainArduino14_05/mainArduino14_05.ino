@@ -1,18 +1,27 @@
 #include <util/atomic.h>
 
+#define F_CPU 16000000
+
+// UART DEFINITIONS
 #define UART_BAUDRATE     38400
 #define TX_BUFFER_SIZE    20
 #define RX_BUFFER_SIZE    20
 
-#define FREQ_TIM1         20        // [Hz] 
-#define FREQ_PWM          25000     // [Hz]
 
+// ARDUINO PIN DEFINITIONS
+#define LED_PIN           13
+#define DIR_MOTOR_PIN     12
+#define BRAKE_MOTOR_PIN   9
+#define PWM_MOTOR_PIN     3
+#define ENCODER_A_PIN     2
+
+
+// CONTROL DEFINITIONS
 #define MAX_TENSION       12    // V
 #define ENCODER_CPR       64    // Encoder Counts per Revolution (CPR)
 #define MOTOR_GEAR_RATIO  50
 #define MAX_I_ERROR       1000
 #define pi                3.1416
-
 #define Kt 38.4615            // Motor Torque Constant
 #define Ke (Kt)
 #define Ra 2.2
@@ -24,7 +33,6 @@
 long prevT = 0;
 int posPrev = 0;
 float v1Prev = 0;
-
 volatile int pos_i=0;                     // Number of counts of the encoder signal (used to calcule motor speed)
 
 typedef struct{
@@ -41,6 +49,7 @@ typedef struct{
   float measured_motor_current=0.0;         // Motor current [A]
   int measured_position=0;                  // Position [m]
   bool simulation_running=false;
+  uint16_t T1_prescaler = 0;
 } Simulation;
 
 char TX_buffer[TX_BUFFER_SIZE];
@@ -80,17 +89,71 @@ void PIController(float setpoint, float deltaT){
   PWM_set_duty(output_dutycycle);
 }
 
-/**
- * Initialisation de l'UART (Universal Asynchronous Receiver-Transmitter) avec les paramètres spécifiés.
- * 
- * @param baud_rate Taux de bauds de communication.
- * @param intRx Activation de l'interruption de réception (1 pour activer, 0 pour désactiver).
- * @param intTx Activation de l'interruption de transmission (1 pour activer, 0 pour désactiver).
- * 
- * Cette fonction configure l'UART pour le fonctionnement souhaité avec les paramètres spécifiés.
- * Elle initialise le registre de bauds, active la réception et/ou la transmission selon les paramètres
- * fournis, et active les interruptions de réception et/ou de transmission si spécifiées.
- */
+
+void TIMER1_init(bool enable, unsigned int T){
+  // Configure TIMER 1
+  // This timer will periodically send data to the PC via the UART
+  // Reset Prescaler (Stop Timer)
+  TCCR1B &= ~(7<<CS10);
+  TCCR1A = 0;
+  TCNT1 = 0;
+  if(enable) {
+    
+    float period = (float) (T/1000.0);
+    float max_period = (float) (pow(2,16)/F_CPU);
+    unsigned int prescaler_T1 = 0;
+    if(period <= max_period) prescaler_T1=1;
+    else if(period <= 8*max_period) prescaler_T1=8;
+    else if(period <= 64*max_period) prescaler_T1=64;
+    else if(period <= 256*max_period) prescaler_T1=256;
+    else if(period <= 1024*max_period) prescaler_T1=1028;
+    else prescaler_T1=0; // Desactivate TIMER in case excessive period
+
+    
+    switch(prescaler_T1) {
+      case 1: //prescaler x1
+      simulation.T1_prescaler |= (1<<CS10);
+      break;
+      case 8: //prescaler x8
+      simulation.T1_prescaler |= (2<<CS10);
+      break;
+      case 64: //prescaler x64
+      simulation.T1_prescaler |= (3<<CS10);
+      break;
+      case 256: //prescaler x256
+      simulation.T1_prescaler |= (4<<CS10);
+      break;
+      case 1028: //prescaler x1024
+      simulation.T1_prescaler |= (5<<CS10);
+      break;
+      default:
+      case 0: //Timer off
+      simulation.T1_prescaler &= ~(7<<CS10);
+      break;
+    }
+    
+    OCR1A = (uint16_t)(((period*F_CPU)/prescaler_T1)-1);
+  }
+  TCCR1B |= (1 << WGM12);
+  
+  // Enable Timer Overflow Interrupt
+  TIMSK1 |= (1 << OCIE1A);
+}
+
+void timer_on(){
+  // Prescaler x1024
+  TCNT1 = 0;
+  TCCR1B |= simulation.T1_prescaler;
+}
+
+void timer_off(){
+  // Reset Prescaler (Stop Timer)
+  TCCR1B &= ~(1<<CS10);
+  TCCR1B &= ~(1<<CS11);
+  TCCR1B &= ~(1<<CS12);
+  TCNT1 = 0;
+}
+
 void UART_init(uint64_t baud_rate, uint8_t intRx, uint8_t intTx) {
   UBRR0 = F_CPU/16/baud_rate-1; // Configuration du registre de bauds
   UCSR0A &= ~(1<<U2X0); // Assure que le bit U2X0 est à 0 (vitesse normale)
@@ -152,10 +215,12 @@ void start_simulation_command(const char *command, Simulation *simulation){
   }   
   // Start simulation
   simulation->simulation_running=true;
+  timer_on();
 }
 
 void stop_simulation_command(const char *command, Simulation *simulation){
   simulation->simulation_running=false;
+  timer_off();
   // Arrêter le moteur
   PWM_set_duty(0);
 }
@@ -175,18 +240,22 @@ void set_parameters_command(const char *command, Simulation *simulation){
 void setup() {
   noInterrupts();                                               // Désactive les interruptions pendant la configuration initiale
   UART_init(UART_BAUDRATE, 1, 0);                               // Initialise la communication UART avec le taux de bauds spécifié
+
+  TIMER1_init(true, simulation.Te);
   // Configuration des broches
-  pinMode(13, OUTPUT);                                          // Configure la broche 13 en sortie
-  pinMode(12, OUTPUT);                                          // Broche Arduino réservée pour le sens de rotation du moteur A
-  pinMode(9, OUTPUT);                                           // Broche Arduino réservée pour le freinage du moteur A
-  pinMode(3, OUTPUT);                                           // Broche PWM pour le contrôle de la vitesse du moteur A
-  pinMode(2, INPUT);                                            // Broche d'entrée pour l'encodeur avec résistance de pull-up activée
-  attachInterrupt(digitalPinToInterrupt(2), encoderISR, RISING); // Associe la fonction d'interruption encoderISR à la broche d'encodeur, déclenchée sur front-montant
+  pinMode(LED_PIN, OUTPUT);                                          // Configure la broche 13 en sortie
+  pinMode(DIR_MOTOR_PIN, OUTPUT);                                          // Broche Arduino réservée pour le sens de rotation du moteur A
+  pinMode(BRAKE_MOTOR_PIN, OUTPUT);                                           // Broche Arduino réservée pour le freinage du moteur A
+  pinMode(PWM_MOTOR_PIN, OUTPUT);                                           // Broche PWM pour le contrôle de la vitesse du moteur A
+  pinMode(ENCODER_A_PIN, INPUT);                                            // Broche d'entrée pour l'encodeur avec résistance de pull-up activée
+  attachInterrupt(digitalPinToInterrupt(ENCODER_A_PIN), encoderISR, RISING); // Associe la fonction d'interruption encoderISR à la broche d'encodeur, déclenchée sur front-montant
 
   // État initial des broches
-  digitalWrite(12, HIGH); // Le moteur A tourne dans le sens normal
-  digitalWrite(9, HIGH);  // Activation du frein moteur A
-  analogWrite(3, 0);      // Pas de vitesse pour le moteur A (PWM)
+  digitalWrite(DIR_MOTOR_PIN, HIGH); // Le moteur A tourne dans le sens normal
+  digitalWrite(BRAKE_MOTOR_PIN, HIGH);  // Activation du frein moteur A
+  analogWrite(PWM_MOTOR_PIN, 0);      // Pas de vitesse pour le moteur A (PWM)
+
+
   
   interrupts(); // Réactive les interruptions après la configuration initiale
 
@@ -194,9 +263,7 @@ void setup() {
 }
 
 void loop() {
-  long currT = micros();
-  float deltaT = ((float) (currT-prevT))/1.0e3;
-  if(simulation.simulation_running==true && deltaT > simulation.Te){  
+  if(simulation.simulation_running==true){  
     // Mesurer la distance de la masse
     simulation.measured_position = get_distance();
     
@@ -206,10 +273,13 @@ void loop() {
     ATOMIC_BLOCK(ATOMIC_RESTORESTATE){
       pos = pos_i;
     }
-    deltaT = deltaT/1.0e3;
+    
+    long currT = micros();
+    float deltaT = ((float) (currT-prevT))/1.0e6;
     float velocity1 = (pos - posPrev)/deltaT;
     posPrev = pos;
-
+    prevT = currT;
+    
     // Convert count/s to RPM
     float v1 = velocity1/800.0*60.0;
     // Low-pass filter (25 Hz cutoff)
@@ -222,37 +292,16 @@ void loop() {
     if(simulation.mode==1){
       PIController(simulation.commanded_motor_speed, deltaT);
     }
-    
-    // Envoyer les données périodiquement
-    sprintf(TX_buffer, "#P%d-V%d-I%d%", simulation.measured_position, simulation.measured_motor_speed, simulation.measured_motor_current);
-    put_string(TX_buffer);
-    prevT = currT;
   }
 
 }
 
-/**
- * Fonction d'interruption pour la gestion des compteurs d'encodeurs.
- * 
- * Cette fonction est appelée à chaque fois qu'une interruption est générée par l'encodeur.
- * Son rôle est d'incrémenter le compteur d'encodeurs pour suivre le nombre d'impulsions reçues.
- */
+
 void encoderISR(){ 
   pos_i++; // Incrément du compteur de l'encodeur
 }
-
-
-/**
- * Routine de service d'interruption (ISR) déclenchée lors de la réception de données sur l'USART.
- * 
- * Cette ISR est activée lorsqu'un caractère est reçu sur le port de communication série (USART).
- * Elle gère la réception de commandes, délimitées par les caractères '#' et '%'. Elle stocke les
- * caractères reçus dans un tampon circulaire jusqu'à ce que la commande soit complète, puis elle
- * passe la commande complète à la fonction de traitement des commandes.
- */
  
 ISR(USART_RX_vect){
-  digitalWrite(13,HIGH);
   char RX_received_char; // Caractère reçu depuis l'USART
   RX_received_char = UDR0; // Lecture du caractère reçu
   
@@ -284,4 +333,10 @@ ISR(USART_RX_vect){
       RX_buffer[rx_index++]=RX_received_char; // Stocker le caractère dans le tampon de réception
       break;
   }
+}
+
+ISR(TIMER1_COMPA_vect) {
+  // Envoyer les données périodiquement
+  sprintf(TX_buffer, "#P%d-V%d-I%d%", simulation.measured_position, simulation.measured_motor_speed, simulation.measured_motor_current);
+  put_string(TX_buffer);
 }
