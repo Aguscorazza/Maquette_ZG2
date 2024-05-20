@@ -1,4 +1,4 @@
-float compteur=0;
+volatile int compteur = 0;
 float nb_tour;
 float nb_tour_min;
 unsigned long current_time=0;
@@ -38,7 +38,7 @@ void loop() {
   }
 
   delay(200);
-  nb_tour = compteur/(50*64/4);
+  nb_tour = (float)compteur/(50*64/4);
   nb_tour_min=nb_tour*60/0.2;
   //Serial.println(nb_tour);//nombre de tour
   Serial.println(nb_tour_min);
@@ -52,10 +52,10 @@ void fonctionA() {
   Serial.println("Touche 'a' pressée");
   previous_time=millis();
   digitalWrite(9, LOW); // Désactivation du frein moteur A
-  analogWrite(3,255);// ne pas mettre en dessous de 50!!!
+  analogWrite(3,1000);// ne pas mettre en dessous de 50!!!
 }
 void fencodeur(){
-  compteur++;
+  compteur = compteur + 1;
 }
 
 // Ajoutez d'autres fonctions pour d'autres caractères si nécessaire
